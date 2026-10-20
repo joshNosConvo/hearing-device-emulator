@@ -14,8 +14,12 @@ ASHA_SIDES = ("left", "right")
 ASHA_MODES = {"asha", "cross-platform"}
 # What each backend can realize today. Extending a backend means editing this table,
 # not the validation code below.
-BACKEND_MODES = {"bluealsa": set(MODES), "bumble": {"a2dp", "asha"}}
-BACKEND_MICROPHONE = {"bluealsa"}
+BACKEND_MODES = {"bluealsa": set(MODES), "bumble": set(MODES)}
+BACKEND_MICROPHONE = {"bluealsa", "bumble"}
+# ALSA capture needs Linux; Bumble feeds the HFP microphone from generated or file audio.
+BACKEND_MIC_SOURCES = {"bluealsa": set(MIC_SOURCES), "bumble": {"tone", "silence", "wav"}}
+# Keys older configs may still carry; dropped on read instead of rejected.
+REMOVED_KEYS = {"bumble_ui_port"}  # bumble-speaker's web UI, replaced by the bumble_device worker
 
 
 @dataclass
@@ -38,9 +42,8 @@ class Config:
     bumble_transport: str = "usb:0"
     bumble_codec: str = "sbc"
     playback_enabled: bool = True
-    record_audio: bool = False  # save each received stream as WAV (Bumble ASHA only)
+    record_audio: bool = False  # save each received stream (Bumble backend)
     alsa_pcm: str = "default"
-    bumble_ui_port: int = 7654
 
     def validate(self) -> None:
         if self.backend not in BACKEND_MODES:
@@ -55,10 +58,18 @@ class Config:
                              f"Use bluealsa for {self.mode}")
         if self.microphone and self.backend not in BACKEND_MICROPHONE:
             raise ValueError(f"HFP microphone transmission is not implemented for the {self.backend} backend")
-        if self.record_audio and (self.backend, self.mode) != ("bumble", "asha"):
-            raise ValueError("record_audio is implemented only for the bumble backend in asha mode")
+        if self.record_audio and self.backend != "bumble":
+            raise ValueError("record_audio is implemented only for the bumble backend")
         if self.mic_source not in MIC_SOURCES:
             raise ValueError(f"mic_source must be one of: {', '.join(MIC_SOURCES)}")
+        if self.microphone and self.mic_source not in BACKEND_MIC_SOURCES[self.backend]:
+            supported = ", ".join(sorted(BACKEND_MIC_SOURCES[self.backend]))
+            raise ValueError(f"The {self.backend} backend's microphone sources are: {supported}")
+        if self.backend == "bumble" and self.microphone and self.mic_sample_rate != 8000:
+            raise ValueError("Bumble's HFP microphone uses CVSD at 8000 Hz; mSBC (16000 Hz) needs a "
+                             "software codec Bumble lacks")
+        if self.backend == "bumble" and self.mic_peer:
+            raise ValueError("mic_peer applies to bluealsa only; Bumble feeds every SCO link it opens")
         if self.microphone and self.mic_source == "wav" and not self.mic_wave_path:
             raise ValueError("mic_wave_path is required for microphone WAV source")
         if not self.mic_alsa_device or any(ch in self.mic_alsa_device for ch in "\n\r\0"):
@@ -85,8 +96,6 @@ class Config:
             raise ValueError("Use a Bumble USB transport (e.g. usb:0, or usb:VID:PID from bumble-usb-probe)")
         if self.bumble_codec not in {"sbc", "aac"}:
             raise ValueError("bumble_codec must be sbc or aac")
-        if not 1024 <= self.bumble_ui_port <= 65535:
-            raise ValueError("bumble_ui_port must be between 1024 and 65535")
         if not self.alsa_pcm or any(ch in self.alsa_pcm for ch in "\n\r\0"):
             raise ValueError("alsa_pcm must not be empty or contain newlines")
 
@@ -107,6 +116,8 @@ def read_config(path: Path = CONFIG_FILE) -> Config:
         config = Config()
     else:
         obj = json.loads(path.read_text(encoding="utf-8"))
+        for key in REMOVED_KEYS:
+            obj.pop(key, None)
         valid_fields = {f.name for f in fields(Config)}
         unknown = set(obj) - valid_fields
         if unknown:

@@ -25,13 +25,24 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "output-only"):
             Config(mode="asha", microphone=True).validate()
 
-    def test_bumble_rejects_asha(self):
-        with self.assertRaisesRegex(ValueError, "bumble backend only implements mode"):
-            Config(backend="bumble", mode="cross-platform").validate()
+    def test_bumble_runs_every_mode_and_the_microphone(self):
+        for mode in ("asha", "a2dp", "cross-platform"):
+            Config(backend="bumble", mode=mode, record_audio=True).validate()
+        Config(backend="bumble", mode="cross-platform", microphone=True, mic_source="tone").validate()
 
-    def test_bumble_rejects_microphone(self):
-        with self.assertRaisesRegex(ValueError, "not implemented"):
-            Config(backend="bumble", microphone=True).validate()
+    def test_bumble_microphone_limits(self):
+        with self.assertRaisesRegex(ValueError, "microphone sources are: silence, tone, wav"):
+            Config(backend="bumble", microphone=True, mic_source="alsa").validate()
+        with self.assertRaisesRegex(ValueError, "CVSD at 8000 Hz"):
+            Config(backend="bumble", microphone=True, mic_sample_rate=16000).validate()
+        with self.assertRaisesRegex(ValueError, "mic_peer applies to bluealsa only"):
+            Config(backend="bumble", microphone=True, mic_peer="AA:BB:CC:DD:EE:FF").validate()
+
+    def test_removed_bumble_ui_port_key_still_loads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            path.write_text('{"backend": "bumble", "bumble_ui_port": 7654}')
+            self.assertEqual(read_config(path).backend, "bumble")
 
     def test_asha_identity_validation(self):
         Config(mode="asha", asha_side="right", asha_sync_id="0123456789ABCDEF").validate()
@@ -76,31 +87,36 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("--asha-advertise", command)
         self.assertFalse(any(arg.startswith("--asha-side") for arg in command))
 
-    def test_bumble_a2dp_command(self):
-        with tempfile.TemporaryDirectory() as d:
-            old = bumble.DATA
-            bumble.DATA = Path(d)
-            try:
-                cmd = bumble.commands(Config(backend="bumble", name="Speaker-Lab"))[0][1]
-                self.assertIn("--device-config", cmd)
-                self.assertIn("usb:0", cmd)
-                self.assertIn("--codec", cmd)
-                self.assertIn("Speaker-Lab", (Path(d) / "bumble-device.json").read_text())
-            finally:
-                bumble.DATA = old
-
-    def test_bumble_asha_command(self):
-        config = Config(backend="bumble", mode="asha", name="CI-Right", asha_side="right",
-                        asha_binaural=True, asha_sync_id="00112233aabbccdd", record_audio=True)
-        label, cmd = bumble.commands(config)[0]
-        self.assertEqual(label, "asha")
-        self.assertEqual(cmd[1:4], ["-u", "-m", "hearing_emulator.workers.bumble_asha"])
-        for flag, value in (("--side", "right"), ("--sync-id", "00112233AABBCCDD"),
-                            ("--name", "CI-Right"), ("--transport", "usb:0")):
+    def test_bumble_runs_one_device_worker_for_all_profiles(self):
+        config = Config(backend="bumble", mode="cross-platform", name="CI-Right", asha_side="right",
+                        asha_binaural=True, asha_sync_id="00112233aabbccdd", microphone=True,
+                        mic_source="tone", bumble_codec="aac", record_audio=True)
+        (label, cmd), = bumble.commands(config)
+        self.assertEqual(label, "device")
+        self.assertEqual(cmd[1:4], ["-u", "-m", "hearing_emulator.workers.bumble_device"])
+        for flag, value in (("--profiles", "asha-sink,a2dp-sink,hfp-hf"), ("--side", "right"),
+                            ("--sync-id", "00112233AABBCCDD"), ("--name", "CI-Right"), ("--codec", "aac"),
+                            ("--mic-source", "tone"), ("--transport", "usb:0+sco=0")):
             self.assertEqual(cmd[cmd.index(flag) + 1], value)
         self.assertIn("--binaural", cmd)
         self.assertIn("--record-dir", cmd)
-        self.assertEqual(cmd[cmd.index("--status-file") + 1], str(bumble.ASHA_STATUS))
+        self.assertEqual(cmd[cmd.index("--status-file") + 1], str(bumble.DEVICE_STATUS))
+        self.assertEqual(cmd[cmd.index("--control-socket") + 1], str(bumble.CONTROL_SOCKET))
+
+    def test_control_socket_falls_back_for_long_home_paths(self):
+        self.assertEqual(bumble.control_socket_path(Path("/Users/qa/.hearing-emulator")),
+                         Path("/Users/qa/.hearing-emulator/bumble-control.sock"))
+        fallback = bumble.control_socket_path(Path("/" + "x" * 120))
+        self.assertLess(len(str(fallback)), 100)
+        self.assertEqual(fallback.name, "control.sock")
+
+    def test_bumble_sco_transport_only_with_microphone(self):
+        plain = bumble.commands(Config(backend="bumble", mode="a2dp"))[0][1]
+        self.assertEqual(plain[plain.index("--transport") + 1], "usb:0")
+        self.assertNotIn("--side", plain)  # ASHA identity only when asha-sink is offered
+        chosen = Config(backend="bumble", microphone=True, bumble_transport="usb:0B05:190E+sco=2")
+        cmd = bumble.commands(chosen)[0][1]
+        self.assertEqual(cmd[cmd.index("--transport") + 1], "usb:0B05:190E+sco=2")
 
     def test_bumble_asha_identity_is_stable_static_random(self):
         left = Config(backend="bumble", mode="asha", name="CI")
@@ -113,8 +129,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(right_sync_id, sync_id)
         self.assertNotEqual(right_address, address)
 
-    def test_record_audio_only_for_bumble_asha(self):
-        Config(backend="bumble", mode="asha", record_audio=True).validate()
+    def test_record_audio_only_for_bumble(self):
         with self.assertRaisesRegex(ValueError, "record_audio"):
             Config(backend="bluealsa", mode="asha", record_audio=True).validate()
 
@@ -153,13 +168,14 @@ class PresetTests(unittest.TestCase):
                 for profile in config.profiles:
                     self.assertIn(profile, PROFILE_ROUTES)
 
-    def test_cochlear_asha_presets_run_on_bumble(self):
-        for name in ("cochlear-asha", "cochlear-asha-pair-left", "cochlear-asha-pair-right"):
+    def test_every_preset_runs_on_bumble(self):
+        for name, preset in PRESETS.items():
             with self.subTest(preset=name):
-                config = replace(Config(backend="bumble"), **PRESETS[name].settings)
+                config = replace(Config(backend="bumble"), **preset.settings)
                 config = replace(config, asha_sync_id="0123456789ABCDEF")
                 config.validate()
-                self.assertEqual(bumble.commands(config)[0][0], "asha")
+                command = bumble.commands(config)[0][1]
+                self.assertEqual(command[command.index("--profiles") + 1], ",".join(config.profiles))
 
     def test_cochlear_asha_is_output_only_hearing_aid(self):
         config = replace(Config(), **PRESETS["cochlear-asha"].settings)

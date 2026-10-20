@@ -91,10 +91,10 @@ class TestMicrophone(unittest.TestCase):
         fake_playback.communicate(timeout=3)
         probe.assert_not_called()
 
-    def test_validation_does_not_claim_bumble_hfp(self):
+    def test_microphone_validation(self):
         Config(mode="a2dp", backend="bluealsa", microphone=True, mic_source="alsa").validate()
-        with self.assertRaisesRegex(ValueError, "bumble backend"):
-            Config(mode="a2dp", backend="bumble", microphone=True).validate()
+        with self.assertRaisesRegex(ValueError, "bumble backend's microphone sources"):
+            Config(mode="a2dp", backend="bumble", microphone=True, mic_source="alsa").validate()
         with self.assertRaises(ValueError):
             Config(mode="asha", microphone=True).validate()
         with self.assertRaises(ValueError):

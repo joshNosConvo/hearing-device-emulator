@@ -1,10 +1,13 @@
-"""Bumble backend: USB-attached A2DP sink or ASHA hearing device on macOS or Linux."""
+"""Bumble backend: one emulated device (ASHA, A2DP, HFP) on a USB adapter, macOS or Linux."""
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
 import json
+import os
+import socket
 import sys
+import tempfile
 
 from ..config import Config
 from ..ops import DATA, capture, ensure_unprivileged, execute, has, ok, is_ubuntu, warn
@@ -21,9 +24,20 @@ REALTEK_DOWNLOAD = ("import sys, bumble.tools, bumble.tools.rtk_util; "
 REALTEK_STATUS = ("from bumble.drivers.rtk import RTK_USB_PRODUCTS, Driver, rtk_firmware_dir; "
                   "print(' '.join(f'{v:04X}:{p:04X}' for v, p in sorted(RTK_USB_PRODUCTS))); "
                   "print(sum((rtk_firmware_dir() / d.fw_name).is_file() for d in Driver.DRIVER_INFOS))")
-ASHA_STATUS = DATA / "asha-status.json"
-ASHA_KEYSTORE = DATA / "bumble-asha-keys.json"
+DEVICE_STATUS = DATA / "device-status.json"
+KEYSTORE = DATA / "bumble-keys.json"
 RECORDINGS = DATA / "recordings"
+
+
+def control_socket_path(data: Path = DATA) -> Path:
+    """Unix socket paths are limited to about 104 bytes; long home paths use a private temp dir."""
+    path = data / "bumble-control.sock"
+    if len(str(path).encode()) < 100:
+        return path
+    return Path(tempfile.gettempdir()) / f"hearing-emulator-{os.getuid()}" / "control.sock"
+
+
+CONTROL_SOCKET = control_socket_path()
 
 
 def tool(binary: str) -> Path:
@@ -31,7 +45,7 @@ def tool(binary: str) -> Path:
 
 
 def installed() -> bool:
-    return tool("bumble-speaker").exists() and tool("bumble-usb-probe").exists()
+    return tool("python").exists() and tool("bumble-usb-probe").exists()
 
 
 def install(force: bool = False) -> None:
@@ -48,8 +62,8 @@ def install(force: bool = False) -> None:
         execute([str(tool("python")), "-m", "pip", "install", "--upgrade", "pip"])
         execute([str(tool("python")), "-m", "pip", "install", "--upgrade", "bumble"])
         if not installed():
-            raise RuntimeError("Bumble installed but speaker/probe command was not found")
-        ok("Bumble A2DP speaker and ASHA runtime installed")
+            raise RuntimeError("Bumble installed but its USB probe command was not found")
+        ok("Bumble installed (ASHA, A2DP and HFP profiles)")
     if _realtek_info()[1] and not force:
         ok("Realtek dongle firmware already downloaded")
         return
@@ -83,43 +97,53 @@ def asha_identity(config: Config) -> tuple[str, str]:
 
 
 def commands(config: Config) -> list[tuple[str, list[str]]]:
-    if config.microphone:
-        raise ValueError("Bumble backend does not implement the HFP microphone")
-    if config.mode == "asha":
-        sync_id, address = asha_identity(config)
-        command = [str(tool("python")), "-u", "-m", "hearing_emulator.workers.bumble_asha",
-                   "--transport", config.bumble_transport, "--name", config.name,
-                   "--side", config.asha_side, "--sync-id", sync_id, "--address", address,
-                   "--keystore", str(ASHA_KEYSTORE), "--status-file", str(ASHA_STATUS)]
+    """One worker presents every configured profile on a single adapter."""
+    sync_id, address = asha_identity(config)
+    transport = config.bumble_transport
+    if config.microphone and transport.startswith("usb:") and "+sco=" not in transport:
+        transport += "+sco=0"  # carry SCO call audio over the adapter's isochronous USB endpoints
+    command = [str(tool("python")), "-u", "-m", "hearing_emulator.workers.bumble_device",
+               "--transport", transport, "--name", config.name, "--profiles", ",".join(config.profiles),
+               "--address", address, "--codec", config.bumble_codec, "--keystore", str(KEYSTORE),
+               "--status-file", str(DEVICE_STATUS), "--control-socket", str(CONTROL_SOCKET)]
+    if "asha-sink" in config.profiles:
+        command.extend(["--side", config.asha_side, "--sync-id", sync_id])
         if config.asha_binaural:
             command.append("--binaural")
-        if config.record_audio:
-            command.extend(["--record-dir", str(RECORDINGS)])
-        if config.playback_enabled and has("ffplay"):
-            command.append("--play")
-        return [("asha", command)]
-    if config.mode != "a2dp":
-        raise ValueError("Bumble backend supports a2dp and asha modes")
-    device_config = DATA / "bumble-device.json"
-    device_config.parent.mkdir(parents=True, exist_ok=True)
-    device_config.write_text(json.dumps({"name": config.name, "class_of_device": 0x240414,
-                                         "keystore": "JsonKeyStore", "classic_enabled": True,
-                                         "le_enabled": False}, indent=2) + "\n", encoding="utf-8")
-    command = [str(tool("bumble-speaker")), "--codec", config.bumble_codec,
-               "--ui-port", str(config.bumble_ui_port),
-               "--device-config", str(device_config)]
-    # With no --output, Bumble serves an audio graph and optional browser playback.
-    # @ffplay adds native host playback only if ffplay is present.
+    if config.microphone:
+        command.extend(["--mic-source", config.mic_source, "--mic-frequency", str(config.mic_frequency),
+                        "--mic-gain", str(config.mic_gain)])
+        if config.mic_source == "wav":
+            command.extend(["--mic-wave-path", config.mic_wave_path])
+    if config.record_audio:
+        command.extend(["--record-dir", str(RECORDINGS)])
     if config.playback_enabled and has("ffplay"):
-        command.extend(["--output", "@ffplay"])
-    command.append(config.bumble_transport)
-    return [("speaker", command)]
+        command.append("--play")
+    return [("device", command)]
+
+
+def control(command: dict, path: Path = CONTROL_SOCKET, timeout: float = 45) -> dict:
+    """Send one command to the running worker (see workers/bumble_device/device.py)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(path))
+            client.sendall(json.dumps(command).encode() + b"\n")
+            response = b""
+            while not response.endswith(b"\n"):
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                response += chunk
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        raise RuntimeError("The Bumble emulator is not running; use 'start' first") from exc
+    return json.loads(response)
 
 
 def doctor(config: Config) -> list[tuple[bool, str]]:
     results = [(sys.version_info >= (3, 11), "Python 3.11+"),
                (sys.platform in {"darwin", "linux"}, "Supported Bumble host (macOS/Linux)"),
-               (installed(), "Bumble speaker and USB probe installed")]
+               (installed(), "Bumble environment and USB probe installed")]
     if installed():
         # --hci-only: without it every USB device (keyboard, hub...) gets a usb: name.
         result = capture([str(tool("bumble-usb-probe")), "--hci-only"], timeout=12)
@@ -133,7 +157,14 @@ def doctor(config: Config) -> list[tuple[bool, str]]:
         if attached:
             results.append((firmware_images > 0, f"Realtek firmware downloaded for {', '.join(attached)} "
                                                  "(fix: install --backend bumble)"))
-        if config.mode == "asha":
-            probe = capture([str(tool("python")), "-c", "import bumble.profiles.asha"])
-            results.append((probe.returncode == 0, "Bumble ASHA profile importable"))
+        probe = capture([str(tool("python")), "-c", "import bumble.profiles.asha, bumble.a2dp, bumble.hfp"])
+        results.append((probe.returncode == 0, "Bumble ASHA, A2DP and HFP profiles importable"))
+    if config.microphone and config.mic_source == "wav":
+        from ..workers.microphone import validate_wave
+        try:
+            validate_wave(Path(config.mic_wave_path), config.mic_sample_rate)
+        except (ValueError, OSError) as exc:
+            results.append((False, f"Microphone WAV file: {exc}"))
+        else:
+            results.append((True, "Microphone WAV format and path valid"))
     return results

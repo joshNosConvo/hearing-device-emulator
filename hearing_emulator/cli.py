@@ -22,7 +22,8 @@ from . import session
 BACKENDS = {"bluealsa": bluealsa, "bumble": bumble}
 MAC_ADDRESS = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 # Workers that publish their own state beyond process RUNNING: label -> (title, status file)
-WORKER_STATUS = {"microphone": ("Microphone", MICROPHONE_STATUS), "asha": ("ASHA", bumble.ASHA_STATUS)}
+WORKER_STATUS = {"microphone": ("Microphone", MICROPHONE_STATUS), "device": ("Device", bumble.DEVICE_STATUS)}
+PROFILE_TITLES = {"asha": "ASHA", "a2dp": "A2DP", "hfp": "HFP", "classic": "Classic link", "device": "Device"}
 
 
 def wizard(config: Config) -> Config:
@@ -65,7 +66,7 @@ def config_action(args: argparse.Namespace) -> None:
     if args.interactive:
         config = wizard(config)
     overrides = {}
-    for key in ("backend", "mode", "name", "hci_device", "bumble_transport", "alsa_pcm", "bumble_ui_port",
+    for key in ("backend", "mode", "name", "hci_device", "bumble_transport", "alsa_pcm",
                 "mic_source", "mic_wave_path", "mic_alsa_device", "mic_peer", "mic_sample_rate",
                 "mic_frequency", "mic_gain", "asha_side", "asha_sync_id"):
         val = getattr(args, key)
@@ -157,14 +158,16 @@ def plan_action(args: argparse.Namespace) -> None:
 
 
 def print_pairing_hint(config: Config) -> None:
-    if config.backend == "bumble" and config.mode == "asha":
-        print(f"Pairing: the emulator advertises '{config.name}' over LE only; no bluetoothctl needed.")
-        print("  Pair from Android Settings > Connected devices > Pair new device (hearing aids are listed there).")
-        print(f"  Bonds persist in {bumble.ASHA_KEYSTORE}. After changing name, side or sync ID,")
-        print("  forget the old device on the phone: the emulator then presents a new identity.")
-        return
     if config.backend == "bumble":
-        print(f"Bumble browser status: http://127.0.0.1:{config.bumble_ui_port} (once speaker starts)")
+        if "asha-sink" in config.profiles:
+            print(f"Pairing (ASHA): the emulator advertises '{config.name}' over LE; no bluetoothctl needed.")
+            print("  Pair from Android Settings > Connected devices > Pair new device (hearing aids are listed there).")
+            print("  After changing name, side or sync ID, forget the old hearing device on the phone first.")
+        if config.mode != "asha":
+            classic = "A2DP and HFP" if config.microphone else "A2DP"
+            print(f"Pairing ({classic}): '{config.name}' is discoverable over Classic Bluetooth;")
+            print("  pair it from the phone's regular Bluetooth settings, on Android or iPhone.")
+        print(f"  Bonds persist in {bumble.KEYSTORE}, so phones reconnect after stop/start.")
         return
     if config.mode == "asha":
         # A real Cochlear processor is LE-only; classic discoverability would let the
@@ -225,7 +228,8 @@ def status_action(args: argparse.Namespace) -> None:
             title, path = WORKER_STATUS[p["label"]]
             worker = read_worker_status(path)
             if worker.get("pid") == p["pid"] and p["alive"]:
-                print(f"    {title} state: {worker.get('state')} | {worker.get('detail')}")
+                for name, item in (worker.get("profiles") or {title: worker}).items():
+                    print(f"    {PROFILE_TITLES.get(name, name)} state: {item.get('state')} | {item.get('detail')}")
             else:
                 print(f"    {title} state: no fresh status; inspect logs --component {p['label']}")
     print("Process status is not proof that an Android/iPhone connection or audio stream is active.")
@@ -244,14 +248,16 @@ def connections_action(args: argparse.Namespace) -> None:
             result = capture(argv, timeout=10)
             print("\n$", " ".join(argv))
             print((result.stdout + result.stderr).strip() or "(No devices or audio PCMs reported)")
-    elif config.mode == "asha":
-        worker = read_worker_status(bumble.ASHA_STATUS)
-        print(f"ASHA state: {worker.get('state', 'unknown')} | {worker.get('detail', 'no status yet')}")
-        print("Bonded phones: " + (", ".join(bonded_phones(bumble.ASHA_KEYSTORE)) or "none"))
     else:
-        print("For Bumble, open the speaker web UI and examine its real-time connection/audio graph:")
-        print(f"  http://127.0.0.1:{config.bumble_ui_port}")
-        print("Or use logs --follow to inspect connection events.")
+        try:
+            live = bumble.control({"command": "status"}, timeout=10)
+        except RuntimeError as exc:
+            print(exc)
+            live = {}
+        print("Connected phones: " + (", ".join(live.get("connections", [])) or "none"))
+        for name, item in live.get("profiles", {}).items():
+            print(f"  {PROFILE_TITLES.get(name, name)}: {item['state']} | {item['detail']}")
+        print("Bonded phones: " + (", ".join(bonded_phones(bumble.KEYSTORE)) or "none"))
     print("Note: paired/connected status is not proof of active interpreter audio or correct microphone routing.")
 
 
@@ -274,10 +280,14 @@ def logs_action(args: argparse.Namespace) -> None:
 def scenario_action(args: argparse.Namespace) -> None:
     config = read_config()
     if args.kind in {"disconnect", "connect"}:
-        if config.backend != "bluealsa":
-            raise ValueError("Direct disconnect/connect is available only through Linux BlueZ in this MVP")
         if not args.address or not MAC_ADDRESS.fullmatch(args.address):
             raise ValueError("Supply --address with a 6-byte Bluetooth MAC address")
+        if config.backend == "bumble":
+            response = bumble.control({"command": args.kind, "address": args.address})
+            print(response.get("detail", ""))
+            if not response.get("ok"):
+                raise RuntimeError(f"{args.kind} failed")
+            return
         command = ["bluetoothctl", args.kind, args.address]
         result = capture(command, timeout=15)
         print((result.stdout + result.stderr).strip())
@@ -329,10 +339,9 @@ def make_parser() -> argparse.ArgumentParser:
     setup.add_argument("--hci-device")
     setup.add_argument("--bumble-transport")
     setup.add_argument("--alsa-pcm")
-    setup.add_argument("--bumble-ui-port", type=int)
     setup.add_argument("--playback", choices=["on", "off"])
     setup.add_argument("--record-audio", choices=["on", "off"],
-                       help="Save each received ASHA stream as WAV (bumble backend, asha mode)")
+                       help="Save each received stream: ASHA/HFP as WAV, A2DP as SBC/AAC (bumble backend)")
     setup.set_defaults(func=config_action)
     inst = sub.add_parser("install", help="Install dependencies for one or both backends")
     inst.add_argument("--backend", choices=[*BACKENDS, "all"],
@@ -357,7 +366,7 @@ def make_parser() -> argparse.ArgumentParser:
     start.set_defaults(func=start_action)
     logs = sub.add_parser("logs", help="Show BlueALSA/Bumble logs")
     logs.add_argument("--tail", type=int, default=40)
-    logs.add_argument("--component", choices=["daemon", "audio", "speaker", "microphone", "asha"])
+    logs.add_argument("--component", choices=["daemon", "audio", "microphone", "device"])
     logs.add_argument("--follow", action="store_true")
     logs.set_defaults(func=logs_action)
     demo = sub.add_parser("mic-sample", help="Generate test tone WAV offline, without Bluetooth hardware")

@@ -67,13 +67,14 @@ start     → doctor preflight → backend.commands(config) → session.start() 
 
   Bumble (macOS/Linux; a complete Bluetooth host stack in Python that drives
           the USB adapter directly, bypassing the OS Bluetooth stack)
-    [speaker]    bumble-speaker: A2DP sink (--mode a2dp)
-    [asha]       python -m hearing_emulator.workers.bumble_asha (--mode asha), run by the
-                 Bumble environment's Python: LE-only ASHA hearing device that
-                 reports START/STOP/volume and can record or play the audio
+    [device]     python -m hearing_emulator.workers.bumble_device, run by the Bumble
+                 environment's Python. One emulated device with the configured profiles:
+                 ASHA over LE; A2DP and HFP (with the injected microphone) over Classic.
+                 Reports each profile's state, records or plays audio, and serves a
+                 control socket for 'connections' and 'scenario connect/disconnect'
 
 session.json records each process's PID and launch time; logs: ~/.hearing-emulator/logs/
-Workers with richer state (asha, microphone) also write <label>-status.json for 'status'.
+Workers with richer state (device, microphone) also write <label>-status.json for 'status'.
 ```
 
 ## What actually works in this starter
@@ -81,16 +82,19 @@ Workers with richer state (asha, microphone) also write <label>-status.json for 
 | Capability | BlueALSA on Ubuntu | Bumble on macOS/Linux |
 |---|---|---|
 | Automated dependency installation | Source build v5.0.0 + D-Bus policy | Isolated Python venv + pip + Realtek firmware |
-| A2DP sink | Configured | `bumble-speaker` app |
-| ASHA sink, side and HiSyncId | Configured | **Implemented**, tested on a simulated link; awaiting phone validation |
-| ASHA runtime feedback (START/STOP, audio type, volume, lost frames, recording) | Logs only | Yes (`status`, `connections`, `--record-audio on`) |
-| Dual ASHA + A2DP | Configured, hardware validation needed | **Not implemented** |
-| HFP profile registration | Configured (experimental) | **Not implemented** |
-| Bluetooth microphone audio injected to phone | **Implemented HFP SCO PCM writer, awaiting device validation** | **Not implemented** |
+| A2DP sink | Configured | **Implemented** (SBC; AAC too with `--bumble-codec aac`) |
+| ASHA sink, side and HiSyncId | Configured | **Implemented** |
+| Dual ASHA + A2DP | Configured, hardware validation needed | **Implemented** (one process, one adapter) |
+| HFP profile registration | Configured (experimental) | **Implemented** (hands-free role, call state reported) |
+| Bluetooth microphone audio injected to phone | **Implemented HFP SCO PCM writer, awaiting device validation** | **Implemented**: CVSD 8 kHz from tone, silence or WAV |
+| Runtime feedback per profile (ASHA START/STOP and volume, A2DP codec, HFP call state, lost frames, recordings) | Logs only | Yes (`status`, `connections`, `--record-audio on`) |
 | Process start/stop/status and logs | Yes | Yes |
 | Receiver restart scenario | Yes | Yes |
-| Explicit disconnect/connect by phone address | Linux BlueZ only | **Not implemented** |
+| Explicit disconnect/connect by phone address | Yes (`bluetoothctl`) | Yes (control socket); ASHA reconnects stay phone-initiated |
 | iOS MFi hearing-device emulation | **Not supported** | **Not supported** |
+
+Everything in the Bumble column is tested on a simulated radio link (unit tests and a
+multi-process run with a scripted phone), not yet with a real phone and adapter.
 
 **Important:** Process RUNNING status does not mean the phone is connected or the
 requested audio route is active. Ubuntu VMware requires a passed-through physical
@@ -115,6 +119,7 @@ controller that meets the same requirements.
 | Dual mode (Classic BR/EDR + LE) | `cochlear-phone-clip`, `a2dp-speaker`, `cross-platform` | Classic A2DP/HFP profiles. Pure ASHA is LE-only |
 | Not claimed by macOS | Bumble on macOS | Bumble needs exclusive USB access. macOS leaves Realtek- and Nordic-based adapters alone; Broadcom-based ones may be taken by macOS's own Bluetooth stack |
 | Controller firmware available to the host | Realtek-based adapters | Realtek chips load firmware at power-up. `install --backend bumble` downloads the images for every Realtek chip Bumble supports; Linux loads them from `linux-firmware` |
+| SCO over USB isochronous endpoints (standard on USB adapters) | HFP microphone | Call audio travels on these endpoints; the Bumble backend claims them with `+sco=0` |
 | One adapter per emulated side | Two-sided ASHA sets | Each side is a separate LE device with its own address |
 | Bluetooth 5.2+ with LE isochronous channels | LE Audio / HAP (future Nucleus 8 work) | Not needed today |
 
@@ -131,6 +136,7 @@ project until the first hardware check passes on it.
 |---|---|---|---|---|
 | ASUS USB-BT500 | Realtek RTL8761BUV | 5.0 | `0B05:190E` | Dual mode; firmware downloaded by `install` |
 | TP-Link UB500 | Realtek RTL8761BUV | 5.0 | `2357:0604` | Dual mode; firmware downloaded by `install` |
+| UGREEN CM390 (part no. 80889) | Realtek RTL8761BUV | 5.0 | `2B89:8761` | Dual mode; firmware downloaded by `install`. Not UGREEN's Bluetooth 5.3 models (CM591, CM656): their chip is unconfirmed and not Realtek |
 | Unbranded "Bluetooth 5.0 USB" adapters with an RTL8761B | Realtek RTL8761B/BUV | 5.0 | often `0BDA:8771` | Works if the USB ID is in Bumble's Realtek list (`doctor` reports it) |
 | Nordic nRF52840 Dongle with Zephyr's `hci_usb` firmware | Nordic nRF52840 | 5.x, LE only | Set by the firmware | Listed as known-working by Bumble; ASHA only (no A2DP/HFP); flash once, no host firmware |
 
@@ -148,6 +154,24 @@ python3 -m hearing_emulator doctor
 `usb:0` is the first Bluetooth adapter found. When several are plugged in (for
 example, one per side), use the `usb:VID:PID` or `usb:VID:PID#N` names that the probe
 prints.
+
+### macOS notes
+
+All the adapters above work with macOS here. The emulator never uses macOS's own
+Bluetooth: Bumble talks to the adapter directly over USB. macOS has no driver for
+Realtek or Nordic Bluetooth chips, so it leaves these adapters free for Bumble.
+
+- **Allow the accessory.** Apple silicon laptops ask "Allow accessory to connect?" the
+  first time a USB device is plugged in. Choose Allow, or the adapter stays invisible.
+- **USB-C.** The Realtek adapters above are USB-A; on most Macs they need a USB-C
+  adapter or hub.
+- **If macOS takes the adapter.** When `doctor` cannot find the adapter or Bumble
+  cannot open it, Bumble's macOS guide says to stop macOS from using USB Bluetooth
+  controllers with `sudo nvram bluetoothHostControllerSwitchBehavior=never` (no reboot
+  needed). The setting comes from Intel-era Macs; leave it unset unless you hit this.
+- **Call microphone unverified on macOS.** HFP call audio uses isochronous USB
+  transfers. The USB library Bumble uses supports them on macOS, but they have not
+  been tried here. ASHA and A2DP don't use them, so test those first.
 
 ## Getting started (Ubuntu)
 
@@ -218,7 +242,9 @@ python3 -m hearing_emulator plan
 python3 -m hearing_emulator doctor
 ```
 
-Use `--preset a2dp-speaker` instead for the iPhone fallback route (Bumble's A2DP speaker).
+Other presets work the same way: `a2dp-speaker` for the iPhone fallback route,
+`cochlear-phone-clip` for a headset with the injected microphone (A2DP + HFP), and
+`--mode cross-platform` to offer ASHA and the Classic profiles at once.
 See [Choosing a Bluetooth adapter](#choosing-a-bluetooth-adapter) for what to plug in
 and how to pick its transport name.
 
@@ -229,7 +255,7 @@ This proves the adapter, Bumble and an ASHA-capable Android phone work together
 
 1. Plug the adapter into the Mac, then `doctor`: all checks should pass.
 2. `configure --backend bumble --preset cochlear-asha --record-audio on`, then `start`.
-3. `logs --component asha --follow` should show `ADVERTISING: 'CI-Left' ...`.
+3. `logs --component device --follow` should show `ADVERTISING: 'CI-Left' ...`.
 4. On the phone: **Settings → Connected devices → Pair new device**. The emulator is
    listed as a hearing aid. Pair it; the log shows `CONNECTED` and `bonded`.
 5. Play media on the phone: the log shows `START MEDIA audio, volume ... dB`, then
@@ -239,6 +265,19 @@ This proves the adapter, Bumble and an ASHA-capable Android phone work together
 7. Check the app under test: Android should report `TYPE_HEARING_AID` for this device.
 
 Record which adapter model passed (or failed) so the example list above can grow.
+
+### Classic profiles check (A2DP and HFP on Bumble)
+
+1. `configure --backend bumble --preset cochlear-phone-clip --record-audio on`, then `start`.
+2. Pair `CI-Left` from the phone's regular Bluetooth settings (Android or iPhone).
+   `status` shows `Classic link state: connected` and `HFP state: connected`.
+3. Play media: `A2DP state: streaming | START SBC 44.1 kHz ...` (AAC if offered and chosen).
+4. Place a call with the headset as the audio route: HFP shows the call state, then
+   `call audio | SCO open (CVSD 8 kHz) ...; sending 440 Hz tone`, with seconds received
+   from the phone and of microphone audio sent. If "from phone" stays at 0, SCO audio
+   is not reaching the computer: the adapter must carry SCO over USB.
+5. Ask the remote party whether they hear the 440 Hz tone. That is the only proof that
+   the phone used the emulated microphone.
 
 Realtek-based adapters run on firmware that Bumble uploads at power-on. `install`
 downloads the images for every Realtek chip Bumble supports (about 0.7 MB), and
@@ -280,16 +319,21 @@ python3 -m hearing_emulator stop
 ```
 
 `start` refuses failed checks unless `--force` is specified, which is **only** for
-debugging. Bumble's browser status UI is at `http://127.0.0.1:7654` by default.
+debugging.
 
 ## Pairing
 
 **ASHA on Bumble.** The emulator advertises over LE only (no classic profiles, like a
 real processor) and needs no `bluetoothctl`: pair from Android **Settings → Connected
-devices → Pair new device**. Bonds persist in `~/.hearing-emulator/bumble-asha-keys.json`,
+devices → Pair new device**. Bonds persist in `~/.hearing-emulator/bumble-keys.json`,
 so the phone reconnects after `stop`/`start`. The address and HiSyncId are derived from
 name, side and sync ID: change any of them and the phone sees a new device (forget the
 old one on the phone).
+
+**Classic on Bumble (A2DP, HFP, cross-platform).** The emulator is discoverable under its
+name; pair it from the phone's regular Bluetooth settings, with no `bluetoothctl`. The
+Classic side uses the adapter's own address and the ASHA side a derived LE address, so
+in cross-platform mode a phone that uses both lists two devices.
 
 **ASHA on BlueALSA (`cochlear-asha`, `--mode asha`).** `bluealsad` advertises the ASHA service
 over LE by itself. A real processor is LE-only, so keep classic discovery off:
@@ -315,28 +359,31 @@ discoverable on
 The iPhone pairs A2DP/HFP in its regular Bluetooth settings, not in the MFi hearing
 devices menu.
 
-## ASHA runtime feedback (Bumble)
+## Runtime feedback (Bumble)
 
-The ASHA worker reports what the phone actually asked for, which is what routing
-tests need to assert:
+The Bumble worker reports, per profile, what the phone actually asked for. Routing
+tests can assert on exactly that:
 
 ```bash
-python3 -m hearing_emulator status        # ASHA state: streaming | START MEDIA audio, volume -20 dB, ...
-python3 -m hearing_emulator connections   # current state and bonded phones
-python3 -m hearing_emulator logs --component asha --follow
+python3 -m hearing_emulator status        # one line per profile: ASHA, Classic link, A2DP, HFP
+python3 -m hearing_emulator connections   # live links, per-profile state, bonded phones
+python3 -m hearing_emulator logs --component device --follow
 ```
 
-| State | Meaning |
+| Profile | States and what they report |
 |---|---|
-| `advertising` | Discoverable/reconnectable; no phone connected |
-| `connected` | A phone is connected (and bonded, once paired); no stream |
-| `streaming` | Phone sent START: audio type (`MEDIA`, `PHONE_CALL`, `RINGTONE`), volume in dB, other side's state; progress every 2 s with seconds received and frames lost |
-| `stopped` | Worker exited, e.g. adapter unplugged (`Bluetooth transport closed`) |
+| ASHA | `advertising` → `connected` → `streaming`: START with audio type (`MEDIA`, `PHONE_CALL`, `RINGTONE`), volume in dB and the other side's state; every 2 s, seconds received and frames lost |
+| Classic link | `discoverable` / `connected` (and bonded) for the phone using A2DP or HFP |
+| A2DP | `connected` → `configured` (the codec the phone chose, e.g. SBC 44.1 kHz joint stereo) → `streaming` → `suspended` when paused |
+| HFP | `connected` (service level) → call state (`incoming call`, `call active`, ...) → `call audio` while SCO is open, with seconds received from the phone and of microphone audio sent |
+| Device | `stopped`: the worker exited, e.g. adapter unplugged (`Bluetooth transport closed`) |
 
 "Frames lost" counts gaps in ASHA's per-frame sequence counter, i.e. audio the phone
-sent that never arrived. `--record-audio on` saves each START…STOP stream as a 16 kHz
-mono WAV in `~/.hearing-emulator/recordings/`; with `--playback on` and `ffplay`
-installed (`brew install ffmpeg`), audio also plays on the computer.
+sent that never arrived. `--record-audio on` saves each stream in
+`~/.hearing-emulator/recordings/`: ASHA as 16 kHz WAV, A2DP as the raw SBC or AAC (ADTS)
+stream (ffplay and VLC play both), and the phone's side of a call as 8 kHz WAV. With
+`--playback on` and `ffplay` installed (`brew install ffmpeg`), ASHA and A2DP audio also
+play on the computer.
 
 ## Configuration reference
 
@@ -388,25 +435,31 @@ python3 -m hearing_emulator configure --backend bluealsa --mode a2dp \
 # Optional: explicitly target the paired phone, or request 16 kHz PCM for mSBC
 python3 -m hearing_emulator configure --mic-peer AA:BB:CC:DD:EE:FF --mic-sample-rate 16000
 
-# Bumble on macOS: ASHA hearing device, or A2DP speaker (no HFP microphone)
+# Bumble on macOS or Linux: every mode; the HFP microphone takes tone, silence or an 8 kHz WAV
 python3 -m hearing_emulator configure --backend bumble --mode asha --record-audio on
-python3 -m hearing_emulator configure --backend bumble --mode a2dp --microphone off
+python3 -m hearing_emulator configure --backend bumble --mode cross-platform --microphone on --mic-source tone
 ```
 
 ## Microphone (HFP)
 
-Bluetooth HFP is bidirectional. When microphone is ON, the BlueALSA backend
-registers `hfp-hf` and runs a supervised Python worker that sends PCM into its
-**SCO playback endpoint**. This is the emulated headset microphone in the phone's
-HFP audio route. The worker supports tone, silence, looping WAV, and ALSA
-physical capture, with a retry loop after the link disappears.
+Bluetooth HFP is bidirectional. When microphone is ON, both backends add the
+hands-free (headset) role and feed an emulated headset microphone into the phone's call:
 
-The microphone worker does **not** inject audio into ASHA or A2DP: ASHA and A2DP
-remain output-only. When both A2DP and HFP are enabled the phone may choose HFP,
+- **BlueALSA:** a supervised worker writes PCM into BlueALSA's **SCO playback
+  endpoint**. Sources: tone, silence, looping WAV, and ALSA physical capture, with a
+  retry loop after the link disappears.
+- **Bumble:** the device worker answers every SCO frame the phone sends with the same
+  amount of microphone audio (tone, silence or looping WAV), so the call itself paces
+  the uplink. Only CVSD (8 kHz) is offered: the adapter converts it, while wideband
+  mSBC would need a software codec Bumble lacks. SCO audio travels over the adapter's
+  isochronous USB endpoints; the backend adds `+sco=0` to the transport automatically
+  (put `+sco=N` in `--bumble-transport` to choose a USB alternate setting).
+
+The microphone is **not** injected into ASHA or A2DP: ASHA and A2DP remain
+output-only. When both A2DP and HFP are enabled the phone may choose HFP,
 which changes the audio codec and iOS route. Keep microphone OFF when testing
 output-only device disappearance, and for a clean A2DP regression set
-`--microphone off` and restart the emulator. Bumble is still A2DP-only, since
-Bumble's `bumble-speaker` app has no SCO microphone audio pipeline integrated here.
+`--microphone off` and restart the emulator.
 
 ### Microphone diagnostics and offline test
 
@@ -430,8 +483,9 @@ python3 -m hearing_emulator logs --component microphone --follow
 bluealsa-aplay -L  # look for PROFILE=sco with playback direction
 ```
 
-The worker reports WAITING until it sees an HFP SCO PCM and FEEDING_PCM when
-writing to the `aplay` process. **This is not confirmation that the phone received
+On Bumble, `status` shows `HFP state: call audio | ... s from phone, ... s of 440 Hz
+tone sent`. On BlueALSA, the worker reports WAITING until it sees an HFP SCO PCM and
+FEEDING_PCM when writing to the `aplay` process. **This is not confirmation that the phone received
 or selected the emulated microphone.** Validate remotely by recording a call
 with the iPhone's microphone route set to the HFP headset and checking that the
 injected test signal is audible on the **remote peer**. For physical input in
@@ -447,13 +501,19 @@ transport on Ubuntu.
 ## Fault and reconnection scenarios
 
 ```bash
-# Linux BlueZ only; use the actual connected phone's Bluetooth address
+# Both backends; use the phone's Bluetooth address (listed by 'connections')
 python3 -m hearing_emulator scenario disconnect --address AA:BB:CC:DD:EE:FF
 python3 -m hearing_emulator scenario connect --address AA:BB:CC:DD:EE:FF
 
 # Both backends: turns emulator off, waits 5 seconds, then restarts
 python3 -m hearing_emulator scenario restart --delay 5
 ```
+
+BlueALSA runs `disconnect`/`connect` through `bluetoothctl`; Bumble sends them to the
+running worker. `disconnect` drops every link to that phone (LE and Classic) while the
+emulator stays available. On Bumble, `connect` opens a Classic link and then A2DP and
+HFP toward the phone. ASHA reconnects are always started by the phone, as with a real
+hearing aid, so for ASHA `connect` only confirms the emulator is advertising.
 
 The phone operating system decides whether a disconnected link reconnects.
 "Restart" validates receiver service recovery, **not automatic handset reconnect**.
@@ -473,15 +533,21 @@ hearing_emulator/
   session.py             # Managed child processes, PID + launch-time checks, text logs
   backends/              # Imported by the CLI: install, doctor, and the commands to launch
     bluealsa.py          # Ubuntu build, D-Bus policy, profiles, conflict and controller diagnostics
-    bumble.py            # Venv installer, Realtek firmware, A2DP speaker / ASHA commands, USB diagnostics
+    bumble.py            # Venv installer, Realtek firmware, device command, control client, USB diagnostics
   workers/               # Separate processes launched by a backend (python -m hearing_emulator.workers.<name>)
     microphone.py        # BlueALSA: HFP SCO microphone PCM worker + offline WAV test
-    bumble_asha.py       # Bumble: ASHA hearing-device worker (runs in the Bumble venv, imports only Bumble + stdlib)
+    bumble_device/       # Bumble: one emulated device (runs in the Bumble venv)
+      device.py          # Composes the profiles, Classic link events, control socket
+      asha.py            # ASHA hearing device (LE)
+      a2dp.py            # A2DP sink (Classic)
+      hfp.py             # HFP hands-free role and the SCO microphone (Classic)
+      media.py           # Recordings and ffplay playback
+      report.py          # Per-profile status for 'status'
 tests/
   test_config.py         # Config, presets, command builders, host-check parsers
   test_microphone.py     # Offline HFP worker/PCM config tests
   test_session.py        # Process start/status/stop and PID-reuse protection
-  test_bumble_asha.py    # ASHA flow against a simulated phone (needs Bumble)
+  test_bumble_device.py  # Bumble worker against a simulated phone (needs Bumble)
 examples/
   test-tone-8khz.wav     # 8 kHz mono test file for --mic-source wav
 ```
@@ -490,13 +556,16 @@ Run offline tests:
 
 ```bash
 python3 -m unittest discover -s tests -v
-# Same suite inside the Bumble environment also runs the ASHA tests (skipped above):
+# Same suite inside the Bumble environment also runs the Bumble tests (skipped above):
 ~/.hearing-emulator/venv-bumble/bin/python -m unittest discover -s tests -v
 ```
 
-The ASHA tests run the real worker against a Bumble central on a simulated radio
-link, acting like Android: read properties, START, 20 ms G.722 frames over the LE
-credit-based channel, volume, STOP, disconnect.
+The Bumble tests run the real worker against a simulated phone on a simulated radio
+link: Android's ASHA client (properties, START, 20 ms G.722 frames, volume, STOP), an
+A2DP source (codec configuration, media packets, suspend), an HFP audio gateway
+(service level connection, call indicators, SCO setup, microphone frames) and the
+CLI's control client (status, disconnect, connect). The simulated link carries no SCO
+audio, so the microphone test feeds in the frames a phone would send.
 
 ### Adding a mode, backend or preset
 
@@ -507,19 +576,22 @@ credit-based channel, volume, STOP, disconnect.
 - **Mode:** add it to `config.MODES` and `Config.profiles`, then to each backend's
   `commands()` and, if it introduces a new profile, to `presets.PROFILE_ROUTES`.
 - **Worker:** when a backend needs a long-running process of this project's own,
-  add a module to `workers/` with a `main()` and launch it from the backend's
-  `commands()` with `-m hearing_emulator.workers.<name>`. If it should show more than
-  RUNNING/STOPPED, write `<label>-status.json` (`pid`, `state`, `detail`) and add it to
-  `cli.WORKER_STATUS`.
+  add a module (or a package with `__main__.py`) to `workers/` and launch it from the
+  backend's `commands()` with `-m hearing_emulator.workers.<name>`. If it should show
+  more than RUNNING/STOPPED, write `<label>-status.json` (`pid`, `state`, `detail`, and
+  optionally `profiles`) and add it to `cli.WORKER_STATUS`.
+- **Bumble profile:** add a module to `workers/bumble_device/` with `progress()` and
+  `close()`, create it in `DeviceEmulator`, and report through the shared `Reporter`.
 
 ## Important limitations & next milestones
 
 - **Hardware unvalidated.** Run the first hardware check with each adapter model, on Ubuntu and macOS separately.
 - **ASHA audio unvalidated.** Check LE peripheral advertising and LE L2CAP CoC on the real adapter.
 - **iOS MFi unavailable.** A2DP does not reproduce iOS `bluetoothLE` hearing device routes.
-- **Bumble ASHA awaiting phone validation.** Tested on a simulated link, not yet with
-  a real Android phone and adapter (see "First hardware check"). One side per machine:
-  a two-sided set needs two computers, each with its own adapter.
+- **Bumble device awaiting phone validation.** ASHA, A2DP, HFP and the microphone are
+  tested on a simulated link, not yet with a real phone and adapter (see the hardware
+  checks). One emulated device per machine: a two-sided ASHA set needs two computers,
+  each with its own adapter.
 - **Bumble upstream issues worked around.** Its G.722 decoder raises `OverflowError` on
   valid frames (missing 16-bit saturation), `AshaService` reports volume as an unsigned
   byte, and `bumble-rtk-fw-download` fails to import `tools.rtk_util`. The emulator
@@ -531,8 +603,8 @@ credit-based channel, volume, STOP, disconnect.
   (`bumble.profiles.hap`); it needs a Bluetooth 5.2+ adapter with isochronous channels.
 - **Windows.** Bumble is cross-platform; on Windows the adapter likely needs a WinUSB
   driver. Not yet tried.
-- **Microphone pipeline (BlueALSA only).** Generated and physical PCM → HFP SCO is coded and offline-tested, but end-to-end phone mic capture and SCO hardware support remain unverified. Bumble HFP SCO needs a separate implementation.
-- **Better runtime feedback.** Add D-Bus PCM state monitoring for BlueALSA and event hooks for Bumble (connected/streaming/disconnected), rather than relying just on logs.
+- **Microphone over SCO unvalidated.** Both backends inject PCM into HFP SCO, but phone-side capture is unverified. On Bumble it depends on the adapter carrying SCO over its USB isochronous endpoints, and only CVSD (narrowband) is offered.
+- **Better runtime feedback on BlueALSA.** Add D-Bus PCM state monitoring; the Bumble worker already reports per-profile events.
 - **Reconnection tests.** Add timed orchestration and assert fallback/resume using phone app diagnostics.
 - **Pairing/security.** Make BlueZ agent lifecycle explicit; avoid implicit host-wide Bluetooth changes.
 - **Release hardening.** Pin the Bumble version, add packaging, support Mac controller permissions safely, add end-to-end hardware tests.
@@ -559,8 +631,11 @@ credit-based channel, volume, STOP, disconnect.
 - https://github.com/arkq/bluez-alsa/blob/v5.0.0/doc/bluealsad.8.rst
 - https://github.com/arkq/bluez-alsa/blob/v5.0.0/doc/bluealsa-aplay.1.rst
 - https://github.com/arkq/bluez-alsa/blob/v5.0.0/doc/bluealsa-plugins.7.rst
-- https://google.github.io/bumble/apps_and_tools/speaker.html
+- https://github.com/google/bumble/blob/main/examples/run_a2dp_sink.py
+- https://github.com/google/bumble/blob/main/examples/run_hfp_handsfree.py
 - https://github.com/google/bumble/blob/main/docs/mkdocs/src/transports/usb.md
+- https://github.com/google/bumble/blob/main/docs/mkdocs/src/platforms/macos.md
+- https://lkml.rescloud.iu.edu/2211.1/00489.html (UGREEN CM390 = RTL8761BUV, `2B89:8761`)
 - https://github.com/google/bumble/blob/main/bumble/profiles/asha.py
 - https://source.android.com/docs/core/connect/bluetooth/asha
 - https://pronews.cochlear.com/connect-apple-and-android-streaming/
