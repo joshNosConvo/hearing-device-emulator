@@ -184,7 +184,7 @@ def commands(config: Config) -> list[tuple[str, list[str]]]:
             listener.append("--profile=SCO")
         result.append(("audio", listener))
     if config.microphone:
-        microphone = [sys.executable, "-u", "-m", "hearing_emulator.microphone",
+        microphone = [sys.executable, "-u", "-m", "hearing_emulator.workers.microphone",
                       "--source", config.mic_source,
                       "--sample-rate", str(config.mic_sample_rate),
                       "--frequency", str(config.mic_frequency),
@@ -224,7 +224,7 @@ def doctor(config: Config) -> list[tuple[bool, str]]:
     if config.microphone:
         results.append((has("arecord") and has("aplay"), "ALSA microphone tools (arecord/aplay)"))
         if config.mic_source == "wav":
-            from ..microphone import validate_wave
+            from ..workers.microphone import validate_wave
             try:
                 validate_wave(Path(config.mic_wave_path), config.mic_sample_rate)
             except (ValueError, OSError) as exc:

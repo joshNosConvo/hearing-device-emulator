@@ -1,8 +1,10 @@
 import getpass
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from hearing_emulator.cli import default_install_targets
 from hearing_emulator.config import Config, read_config, save_config
@@ -87,6 +89,53 @@ class ConfigTests(unittest.TestCase):
             finally:
                 bumble.DATA = old
 
+    def test_bumble_asha_command(self):
+        config = Config(backend="bumble", mode="asha", name="CI-Right", asha_side="right",
+                        asha_binaural=True, asha_sync_id="00112233aabbccdd", record_audio=True)
+        label, cmd = bumble.commands(config)[0]
+        self.assertEqual(label, "asha")
+        self.assertEqual(cmd[1:4], ["-u", "-m", "hearing_emulator.workers.bumble_asha"])
+        for flag, value in (("--side", "right"), ("--sync-id", "00112233AABBCCDD"),
+                            ("--name", "CI-Right"), ("--transport", "usb:0")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], value)
+        self.assertIn("--binaural", cmd)
+        self.assertIn("--record-dir", cmd)
+        self.assertEqual(cmd[cmd.index("--status-file") + 1], str(bumble.ASHA_STATUS))
+
+    def test_bumble_asha_identity_is_stable_static_random(self):
+        left = Config(backend="bumble", mode="asha", name="CI")
+        sync_id, address = bumble.asha_identity(left)
+        self.assertEqual((sync_id, address), bumble.asha_identity(left))  # bond survives restarts
+        self.assertRegex(sync_id, r"^[0-9A-F]{16}$")
+        self.assertGreaterEqual(int(address[:2], 16), 0xC0)  # static random: top bits 11
+        right = replace(left, asha_side="right", asha_binaural=True, asha_sync_id=sync_id)
+        right_sync_id, right_address = bumble.asha_identity(right)
+        self.assertEqual(right_sync_id, sync_id)
+        self.assertNotEqual(right_address, address)
+
+    def test_record_audio_only_for_bumble_asha(self):
+        Config(backend="bumble", mode="asha", record_audio=True).validate()
+        with self.assertRaisesRegex(ValueError, "record_audio"):
+            Config(backend="bluealsa", mode="asha", record_audio=True).validate()
+
+    def test_doctor_checks_firmware_for_any_known_realtek_dongle(self):
+        probe = "Bumble Transport Names: usb:0 or usb:2357:0604\n"  # TP-Link UB500, not the BT500
+
+        def fake_capture(cmd, timeout=12):
+            if "--hci-only" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, probe, "")
+            if cmd[-1] == bumble.REALTEK_STATUS:
+                return subprocess.CompletedProcess(cmd, 0, "0B05:190E 2357:0604\n0\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(bumble, "installed", return_value=True), \
+                patch.object(bumble, "capture", fake_capture):
+            checks = {label: passed for passed, label in bumble.doctor(Config(backend="bumble"))}
+        firmware = [label for label in checks if label.startswith("Realtek firmware")]
+        self.assertEqual(len(firmware), 1)
+        self.assertIn("2357:0604", firmware[0])
+        self.assertFalse(checks[firmware[0]])
+
     def test_install_defaults_to_bumble_off_linux(self):
         self.assertEqual(default_install_targets("darwin"), ["bumble"])
         self.assertEqual(default_install_targets("linux"), ["bluealsa", "bumble"])
@@ -103,6 +152,14 @@ class PresetTests(unittest.TestCase):
                 bluealsa.commands(config)
                 for profile in config.profiles:
                     self.assertIn(profile, PROFILE_ROUTES)
+
+    def test_cochlear_asha_presets_run_on_bumble(self):
+        for name in ("cochlear-asha", "cochlear-asha-pair-left", "cochlear-asha-pair-right"):
+            with self.subTest(preset=name):
+                config = replace(Config(backend="bumble"), **PRESETS[name].settings)
+                config = replace(config, asha_sync_id="0123456789ABCDEF")
+                config.validate()
+                self.assertEqual(bumble.commands(config)[0][0], "asha")
 
     def test_cochlear_asha_is_output_only_hearing_aid(self):
         config = replace(Config(), **PRESETS["cochlear-asha"].settings)

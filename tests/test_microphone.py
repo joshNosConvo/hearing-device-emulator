@@ -9,10 +9,10 @@ import unittest
 from unittest.mock import patch
 import wave
 
-from hearing_emulator import microphone
+from hearing_emulator.workers import microphone
 from hearing_emulator.backends.bluealsa import commands
 from hearing_emulator.config import Config
-from hearing_emulator.microphone import (
+from hearing_emulator.workers.microphone import (
     generate_sample, has_sco_playback, pcm_device, pcm_silence, pcm_tone,
     validate_wave, _feed,
 )
@@ -62,7 +62,7 @@ class TestMicrophone(unittest.TestCase):
         labels = dict(commands(config))
         self.assertIn("hfp-hf", " ".join(labels["daemon"]))
         self.assertIn("microphone", labels)
-        self.assertIn("hearing_emulator.microphone", labels["microphone"])
+        self.assertIn("hearing_emulator.workers.microphone", labels["microphone"])
         self.assertIn("--source", labels["microphone"])
         config = Config(mode="a2dp", microphone=False)
         self.assertNotIn("microphone", dict(commands(config)))

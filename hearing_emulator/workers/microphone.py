@@ -26,8 +26,8 @@ import json
 import wave
 from typing import Iterator
 
-from .config import MIC_SOURCES
-from .ops import capture, DATA
+from ..config import MIC_SOURCES
+from ..ops import capture, DATA
 
 CHUNK_MS = 20
 STOP = False

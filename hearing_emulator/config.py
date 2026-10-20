@@ -14,7 +14,7 @@ ASHA_SIDES = ("left", "right")
 ASHA_MODES = {"asha", "cross-platform"}
 # What each backend can realize today. Extending a backend means editing this table,
 # not the validation code below.
-BACKEND_MODES = {"bluealsa": set(MODES), "bumble": {"a2dp"}}
+BACKEND_MODES = {"bluealsa": set(MODES), "bumble": {"a2dp", "asha"}}
 BACKEND_MICROPHONE = {"bluealsa"}
 
 
@@ -38,6 +38,7 @@ class Config:
     bumble_transport: str = "usb:0"
     bumble_codec: str = "sbc"
     playback_enabled: bool = True
+    record_audio: bool = False  # save each received stream as WAV (Bumble ASHA only)
     alsa_pcm: str = "default"
     bumble_ui_port: int = 7654
 
@@ -54,6 +55,8 @@ class Config:
                              f"Use bluealsa for {self.mode}")
         if self.microphone and self.backend not in BACKEND_MICROPHONE:
             raise ValueError(f"HFP microphone transmission is not implemented for the {self.backend} backend")
+        if self.record_audio and (self.backend, self.mode) != ("bumble", "asha"):
+            raise ValueError("record_audio is implemented only for the bumble backend in asha mode")
         if self.mic_source not in MIC_SOURCES:
             raise ValueError(f"mic_source must be one of: {', '.join(MIC_SOURCES)}")
         if self.microphone and self.mic_source == "wav" and not self.mic_wave_path:
@@ -79,7 +82,7 @@ class Config:
         if not self.hci_device.startswith("hci") or not self.hci_device[3:].isdigit():
             raise ValueError("hci_device must look like hci0")
         if not self.bumble_transport.startswith(("usb:", "pyusb:")):
-            raise ValueError("Use a Bumble USB transport (e.g. usb:0 or usb:0b05:190e)")
+            raise ValueError("Use a Bumble USB transport (e.g. usb:0, or usb:VID:PID from bumble-usb-probe)")
         if self.bumble_codec not in {"sbc", "aac"}:
             raise ValueError("bumble_codec must be sbc or aac")
         if not 1024 <= self.bumble_ui_port <= 65535:
