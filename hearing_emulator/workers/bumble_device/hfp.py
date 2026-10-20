@@ -21,6 +21,12 @@ from .report import Reporter
 SDP_HANDLE = 0x00010002
 SAMPLE_RATE = 8000
 CALL_AUDIO = "call audio"  # state while an SCO link carries call audio
+# Bumble's USB transport sends one transfer at a time, ~5 ms each almost regardless of size
+# (about 190/s on macOS with a Realtek dongle). Answering each phone packet with one of the
+# same size (48-60 bytes) fell behind real time and delayed every HCI command queued after it.
+# Batching the microphone into 15 ms packets keeps the uplink well ahead of real time.
+MIC_BATCH_BYTES = 240
+MAX_QUEUED_PACKETS = 8  # past this, drop microphone audio rather than delay commands and ACL data
 CALL_STATES = {
     hfp.AgIndicator.CALL: {0: "no active call", 1: "call active"},
     hfp.AgIndicator.CALL_SETUP: {0: "call setup ended", 1: "incoming call", 2: "outgoing call dialing",
@@ -64,6 +70,8 @@ class CallAudio:
     def __init__(self, record_dir: Path | None) -> None:
         self.received = 0  # samples from the phone
         self.sent = 0  # microphone samples to the phone
+        self.dropped = 0  # microphone samples skipped because the USB uplink was backed up
+        self.owed = 0  # bytes of microphone audio matching received audio, not yet sent
         self.path = recording_path(record_dir, "hfp", "call", ".wav") if record_dir else None
         self.wav: wave.Wave_write | None = open_wav(self.path, SAMPLE_RATE) if self.path else None
 
@@ -82,6 +90,7 @@ class HandsFree:
         self.configuration = configuration()
         self.call: CallAudio | None = None
         self.state = "waiting"
+        self.batch = MIC_BATCH_BYTES
         channel = rfcomm.Server(device).listen(self.attach)
         device.sdp_service_records[SDP_HANDLE] = hfp.make_hf_sdp_records(SDP_HANDLE, channel, self.configuration)
         device.on(device.EVENT_SCO_REQUEST, self._on_sco_request)
@@ -97,6 +106,11 @@ class HandsFree:
         protocol.on(protocol.EVENT_MICROPHONE_VOLUME,
                     lambda level: self._set(self.state, f"microphone volume {level}/15"))
         asyncio.get_running_loop().create_task(self._run(protocol, dlc.multiplexer.l2cap_channel.connection))
+
+    async def start(self) -> None:
+        """Size microphone packets to the controller's SCO buffers (0: it reports none)."""
+        sizes = await self.device.host.send_sync_command(hci.HCI_Read_Buffer_Size_Command())
+        self.batch = min(MIC_BATCH_BYTES, sizes.hc_synchronous_data_packet_length or MIC_BATCH_BYTES) // 2 * 2
 
     def progress(self) -> None:
         if self.call:
@@ -170,6 +184,8 @@ class HandsFree:
         summary = f"{self.call.received / SAMPLE_RATE:.1f} s from phone"
         if self.microphone:
             summary += f", {self.call.sent / SAMPLE_RATE:.1f} s of {self.microphone.label} sent"
+            if self.call.dropped:
+                summary += f" ({self.call.dropped / SAMPLE_RATE:.1f} s dropped: USB uplink too slow)"
         if self.call.received == 0:
             summary += " (no SCO audio reaching the computer yet: the adapter must carry SCO over USB)"
         if self.call.path:
@@ -177,18 +193,29 @@ class HandsFree:
         return summary
 
     def _on_sco_packet(self, packet: hci.HCI_SynchronousDataPacket) -> None:
-        # The phone sends SCO frames at the link's fixed rate; answering each with the same
-        # amount of microphone audio keeps the uplink paced without a timer.
+        # The phone sends SCO frames at the link's fixed rate; answering with the same amount
+        # of microphone audio keeps the uplink paced without a timer.
         try:
             if not self.call:
                 return
-            samples = len(packet.data) // 2
-            self.call.received += samples
+            self.call.received += len(packet.data) // 2
             if self.call.wav and packet.packet_status == hci.HCI_SynchronousDataPacket.Status.CORRECTLY_RECEIVED_DATA:
                 self.call.wav.writeframes(packet.data)
-            if self.microphone:
-                self.device.host.send_sco_sdu(connection_handle=packet.connection_handle,
-                                              sdu=self.microphone.read(len(packet.data)))
-                self.call.sent += samples
+            if not self.microphone:
+                return
+            self.call.owed += len(packet.data)
+            while self.call.owed >= self.batch:
+                self.call.owed -= self.batch
+                audio = self.microphone.read(self.batch)  # read even when dropped, to stay in time
+                if self._uplink_backlog() > MAX_QUEUED_PACKETS:
+                    self.call.dropped += self.batch // 2
+                    continue
+                self.device.host.send_sco_sdu(connection_handle=packet.connection_handle, sdu=audio)
+                self.call.sent += self.batch // 2
         except Exception as exc:  # noqa: BLE001 - keep the call link alive
             logging.getLogger(__name__).warning("Dropped SCO frame: %s", exc)
+
+    def _uplink_backlog(self) -> int:
+        """Packets waiting in Bumble's USB transport; other transports expose no queue."""
+        queue = getattr(self.device.host.hci_sink, "packets", None)
+        return queue.qsize() if isinstance(queue, asyncio.Queue) else 0

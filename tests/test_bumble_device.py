@@ -36,6 +36,7 @@ try:
     from hearing_emulator.backends import bumble as bumble_backend
     from hearing_emulator.workers.bumble_device import asha as asha_worker
     from hearing_emulator.workers.bumble_device.device import DeviceEmulator, device_config, serve_control
+    from hearing_emulator.workers.bumble_device import hfp as hfp_worker
     from hearing_emulator.workers.bumble_device.hfp import PcmSource
     from hearing_emulator.workers.bumble_device.report import Reporter
 except ImportError:
@@ -261,21 +262,36 @@ class HfpTests(SimulatedLink):
         self.assertIn("sending 440 Hz tone", self.profile("hfp")["detail"])
 
         # The simulated link carries no SCO audio, so feed the frames a phone would send.
-        sent = []
-        with patch.object(self.emulator.device.host, "send_sco_sdu",
-                          lambda connection_handle, sdu: sent.append((connection_handle, sdu))):
-            for _ in range(50):
+        def phone_frames(count: int) -> None:
+            for _ in range(count):
                 link.sink(hci.HCI_SynchronousDataPacket(
                     connection_handle=link.handle,
                     packet_status=hci.HCI_SynchronousDataPacket.Status.CORRECTLY_RECEIVED_DATA,
                     data_total_length=120, data=bytes(120)))
+
+        sent = []
+        with patch.object(self.emulator.device.host, "send_sco_sdu",
+                          lambda connection_handle, sdu: sent.append((connection_handle, sdu))):
+            phone_frames(50)
         self.assertEqual({handle for handle, _ in sent}, {link.handle})
+        self.assertEqual({len(sdu) for _, sdu in sent}, {hfp_worker.MIC_BATCH_BYTES})
         microphone = struct.unpack("<3000h", b"".join(sdu for _, sdu in sent))  # same amount as received
         self.assertGreater(max(microphone), 6000)  # 440 Hz tone at gain 0.2
         self.emulator.hfp.progress()
         self.assertIn("0.4 s from phone, 0.4 s of 440 Hz tone sent", self.profile("hfp")["detail"])
         recordings = list(self.options.record_dir.glob("hfp-*-call.wav"))
         self.assertEqual(len(recordings), 1)
+
+        # A backed-up USB transport drops microphone audio instead of delaying HCI commands.
+        backlog = asyncio.Queue()
+        for _ in range(hfp_worker.MAX_QUEUED_PACKETS + 1):
+            backlog.put_nowait(b"")
+        with patch.object(self.emulator.device.host.hci_sink, "packets", backlog, create=True), \
+                patch.object(self.emulator.device.host, "send_sco_sdu") as send:
+            phone_frames(10)
+        send.assert_not_called()
+        self.emulator.hfp.progress()
+        self.assertIn("(0.1 s dropped: USB uplink too slow)", self.profile("hfp")["detail"])
 
 
 class CrossPlatformControlTests(SimulatedLink):

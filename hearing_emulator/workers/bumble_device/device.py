@@ -81,6 +81,8 @@ class DeviceEmulator:
 
     async def start(self) -> None:
         await self.device.power_on()
+        if self.hfp:
+            await self.hfp.start()
         if self.asha:
             await self.asha.start_advertising()
         if self.classic:
