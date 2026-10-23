@@ -22,6 +22,7 @@ from ..microphone import pcm_silence, pcm_tone, pcm_wave, validate_wave
 from .a2dp import A2dpSink
 from .asha import AshaEmulator
 from .hfp import SAMPLE_RATE as HFP_SAMPLE_RATE, HandsFree, PcmSource
+from .l2cap_compat import accept_flush_timeout
 from .report import Reporter
 
 PROFILES = ("asha-sink", "a2dp-sink", "hfp-hf")
@@ -73,6 +74,8 @@ class DeviceEmulator:
         self.hfp = HandsFree(device, report, microphone_source(options),
                              options.record_dir) if "hfp-hf" in profiles else None
         self.classic = bool(self.a2dp or self.hfp)
+        if self.classic:
+            accept_flush_timeout()  # an iPhone never streams A2DP without it
         device.on(device.EVENT_CONNECTION, self._on_connection)
 
     @property
