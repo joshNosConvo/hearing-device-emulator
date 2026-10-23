@@ -122,6 +122,7 @@ class A2dpSink:
         """Expose the sink endpoints on an AVDTP session (opened by the phone or by `connect`)."""
         peer = server.l2cap_channel.connection.peer_address.to_string(False)
         self.report("a2dp", "connected", f"media channel open with phone {peer}")
+        server.on(server.EVENT_CLOSE, functools.partial(self._on_session_close, peer))
         for capabilities in self.capabilities:
             sink = server.add_sink(capabilities)
             sink.on(sink.EVENT_CONFIGURATION, functools.partial(self._on_configuration, sink))
@@ -129,6 +130,7 @@ class A2dpSink:
             sink.on(sink.EVENT_SUSPEND, functools.partial(self._on_end, "suspended", "paused by the phone"))
             sink.on(sink.EVENT_CLOSE, functools.partial(self._on_end, "connected", "stream closed"))
             sink.on(sink.EVENT_ABORT, functools.partial(self._on_end, "connected", "stream aborted"))
+            sink.on(sink.EVENT_RTP_CHANNEL_CLOSE, self._on_media_channel_close)
             sink.on(sink.EVENT_RTP_PACKET, self._on_rtp_packet)
 
     def progress(self) -> None:
@@ -162,6 +164,16 @@ class A2dpSink:
     def _on_end(self, state: str, why: str) -> None:
         summary = self._end_stream()
         self.report("a2dp", state, f"{why}; {summary}" if summary else why)
+
+    def _on_media_channel_close(self) -> None:
+        # A CLOSE or ABORT from the phone was already reported. Any other close of the
+        # media channel leaves the stream unusable, so the phone no longer plays here.
+        if self.report.profiles.get("a2dp", {}).get("state") not in ("configured", "streaming", "suspended"):
+            return
+        self._on_end("connected", "media channel closed unexpectedly; the phone no longer routes audio here")
+
+    def _on_session_close(self, peer: str) -> None:
+        self._on_end("disconnected", f"media session with phone {peer} closed")
 
     def _on_rtp_packet(self, packet: MediaPacket) -> None:
         try:

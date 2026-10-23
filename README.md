@@ -374,7 +374,7 @@ python3 -m hearing_emulator logs --component device --follow
 |---|---|
 | ASHA | `advertising` → `connected` → `streaming`: START with audio type (`MEDIA`, `PHONE_CALL`, `RINGTONE`), volume in dB and the other side's state; every 2 s, seconds received and frames lost |
 | Classic link | `discoverable` / `connected` (and bonded) for the phone using A2DP or HFP |
-| A2DP | `connected` → `configured` (the codec the phone chose, e.g. SBC 44.1 kHz joint stereo) → `streaming` → `suspended` when paused |
+| A2DP | `connected` → `configured` (the codec the phone chose, e.g. SBC 44.1 kHz joint stereo) → `streaming` → `suspended` when paused; back to `connected` when the phone closes the stream or drops its media channel, `disconnected` when the media session ends |
 | HFP | `connected` (service level) → call state (`incoming call`, `call active`, ...) → `call audio` while SCO is open, with seconds received from the phone and of microphone audio sent |
 | Device | `stopped`: the worker exited, e.g. adapter unplugged (`Bluetooth transport closed`) |
 
@@ -541,6 +541,7 @@ hearing_emulator/
       asha.py            # ASHA hearing device (LE)
       a2dp.py            # A2DP sink (Classic)
       hfp.py             # HFP hands-free role and the SCO microphone (Classic)
+      l2cap_compat.py    # Bumble L2CAP fixes real phones need (iPhone Flush Timeout)
       media.py           # Recordings and ffplay playback
       report.py          # Per-profile status for 'status'
 tests/
@@ -594,8 +595,11 @@ audio, so the microphone test feeds in the frames a phone would send.
   each with its own adapter.
 - **Bumble upstream issues worked around.** Its G.722 decoder raises `OverflowError` on
   valid frames (missing 16-bit saturation), `AshaService` reports volume as an unsigned
-  byte, and `bumble-rtk-fw-download` fails to import `tools.rtk_util`. The emulator
-  works around all three; worth reporting upstream.
+  byte, `bumble-rtk-fw-download` fails to import `tools.rtk_util`, and L2CAP rejects the
+  standard Flush Timeout option as unknown. An iPhone asks for one (200 ms) on its A2DP
+  channels and repeats the configuration until it closes the media channel, so A2DP was
+  configured but never streamed. The emulator works around all four; worth reporting
+  upstream.
 - **ASHA Device Information Service.** Android's ASHA spec asks the hearing device to
   implement the Device Information Service (manufacturer and model names); the Bumble
   emulator doesn't expose it yet.

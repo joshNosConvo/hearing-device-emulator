@@ -11,6 +11,7 @@ Under an interpreter without Bumble (the CLI's own) the tests are skipped.
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import io
 import json
 from pathlib import Path
@@ -213,6 +214,75 @@ class A2dpAacTests(SimulatedLink):
                   for capability in endpoint.capabilities
                   if isinstance(capability, avdtp.MediaCodecCapabilities)]
         self.assertEqual(sorted(codecs), sorted([a2dp.CodecType.MPEG_2_4_AAC, a2dp.CodecType.SBC]))
+
+
+IPHONE_FLUSH_TIMEOUT = bytes([0x02, 0x02, 0xC8, 0x00])  # option 0x02, 200 ms, as an iPhone asks
+
+
+def send_like_an_iphone(send_control_frame):
+    """Adds the Flush Timeout an iPhone asks for to every L2CAP configuration request."""
+
+    def send(channel, frame):
+        if isinstance(frame, l2cap.L2CAP_Configure_Request):
+            frame = dataclasses.replace(frame, options=frame.options + IPHONE_FLUSH_TIMEOUT)
+        send_control_frame(channel, frame)
+
+    return send
+
+
+class A2dpIphoneTests(SimulatedLink):
+    profiles = ["a2dp-sink"]
+
+    async def asyncSetUp(self):
+        self.enterContext(patch.object(l2cap.ClassicChannel, "send_control_frame",
+                                       send_like_an_iphone(l2cap.ClassicChannel.send_control_frame)))
+        await super().asyncSetUp()
+
+    async def test_streams_when_the_phone_asks_for_a_flush_timeout(self):
+        # Rejected as an unknown option, the phone repeats the configuration and the
+        # channels never open, which is what kept an iPhone from streaming
+        client = await asyncio.wait_for(avdtp.Protocol.connect(await self.connect_classic()), 2)
+        endpoints = list(await client.discover_remote_endpoints())
+        stream = await client.create_stream(client.add_source(phone_sbc_source(), None), endpoints[0])
+        await asyncio.wait_for(stream.start(), 2)
+        stream.send_media_packet(MediaPacket(2, 0, 0, 0, 0, 0, 0, [], 96, bytes([1]) + bytes(10)))
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.profile("a2dp")["state"], "streaming")
+
+
+class A2dpLinkLossTests(SimulatedLink):
+    profiles = ["a2dp-sink"]
+
+    async def configured_stream(self):
+        self.connection = await self.connect_classic()
+        client = await avdtp.Protocol.connect(self.connection)
+        endpoints = list(await client.discover_remote_endpoints())
+        stream = await client.create_stream(client.add_source(phone_sbc_source(), None), endpoints[0])
+        await asyncio.sleep(0.05)
+        return stream
+
+    async def test_media_channel_closed_by_the_phone_no_longer_reads_configured(self):
+        stream = await self.configured_stream()
+        await stream.open()
+        await stream.rtp_channel.disconnect()
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.profile("a2dp")["state"], "connected")
+        self.assertIn("media channel closed unexpectedly", self.profile("a2dp")["detail"])
+
+    async def test_a_clean_close_is_reported_once(self):
+        stream = await self.configured_stream()
+        await stream.start()
+        await stream.close()
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.profile("a2dp")["state"], "connected")
+        self.assertTrue(self.profile("a2dp")["detail"].startswith("stream closed; SBC"))
+
+    async def test_link_loss_ends_the_session(self):
+        await self.configured_stream()
+        await self.connection.disconnect()
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.profile("a2dp")["state"], "disconnected")
+        self.assertIn(f"media session with phone {PHONE} closed", self.profile("a2dp")["detail"])
 
 
 def phone_audio_gateway() -> "hfp.AgConfiguration":
